@@ -30,6 +30,27 @@ services:
     networks:
       - elk
 
+  # ES 초기화 - index template 자동 등록 후 종료
+  es-setup:
+    image: curlimages/curl:latest
+    container_name: es-setup
+    depends_on:
+      - elasticsearch
+    networks:
+      - elk
+    restart: "no"  # 한 번 실행 후 종료
+    entrypoint:
+      - sh
+      - -c
+      - |
+        echo 'ES 준비 대기 중...' &&
+        until curl -s http://elasticsearch:9200/_cluster/health > /dev/null; do
+          sleep 2;
+        done &&
+        echo 'index template 등록 중...' &&
+        curl -s -X PUT 'http://elasticsearch:9200/_index_template/logs-template' -H 'Content-Type: application/json' -d '{"index_patterns":["logs-*"],"template":{"settings":{"refresh_interval":"5s","number_of_shards":1,"number_of_replicas":0}},"priority":1}' &&
+        echo 'template 등록 완료!'
+
   # Logstash - 로그 수집 및 변환
   logstash:
     image: docker.elastic.co/logstash/logstash:8.11.0
