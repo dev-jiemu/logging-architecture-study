@@ -2,10 +2,14 @@
 """
 ELK 스택 부하 테스트 스크립트
 Phase 1의 한계를 찾아서 Phase 2의 필요성을 체감하기 위한 도구
+
+[v2] 비동기(asyncio + aiohttp) 전환
+- 기존: 동기 requests + sleep → 응답 대기 시간이 interval을 잠식해 목표 처리율 미달
+- 변경: 각 워커가 asyncio.sleep 으로 interval을 정확히 지키며 비동기 요청
 """
 
-import requests
-import json
+import asyncio
+import aiohttp
 import time
 import random
 import threading
@@ -25,6 +29,7 @@ stats = {
     "latencies": deque(maxlen=1000),  # 최근 1000개만 유지
     "start_time": None
 }
+stats_lock = asyncio.Lock()  # 비동기 환경에서 stats 보호용
 
 def generate_log():
     """로그 생성"""
@@ -40,46 +45,46 @@ def generate_log():
         "ip_address": f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}"
     }
 
-def send_log_worker(worker_id, target_rate, duration):
-    """워커 스레드 - 로그 전송"""
-    local_sent = 0
-    local_failed = 0
+async def fire_request(session):
+    """단건 요청 발사 - 응답 처리만 담당 (워커와 분리)"""
+    try:
+        log = generate_log()
+        start = time.time()
 
+        async with session.post(
+            LOGSTASH_URL,
+            json=log,
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as response:
+            latency = (time.time() - start) * 1000  # ms
+
+            if response.status == 200:
+                async with stats_lock:
+                    stats["sent"] += 1
+                    stats["latencies"].append(latency)
+            else:
+                async with stats_lock:
+                    stats["failed"] += 1
+
+    except Exception:
+        async with stats_lock:
+            stats["failed"] += 1
+
+async def send_log_worker(session, worker_id, target_rate, duration):
+    """비동기 워커 - interval마다 요청을 fire-and-forget으로 발사"""
     end_time = time.time() + duration
     interval = 1.0 / target_rate if target_rate > 0 else 0
 
     while time.time() < end_time:
-        try:
-            log = generate_log()
-            start = time.time()
-
-            response = requests.post(
-                LOGSTASH_URL,
-                json=log,
-                headers={"Content-Type": "application/json"},
-                timeout=5
-            )
-
-            latency = (time.time() - start) * 1000  # ms
-
-            if response.status_code == 200:
-                local_sent += 1
-                stats["latencies"].append(latency)
-            else:
-                local_failed += 1
-
-        except Exception as e:
-            local_failed += 1
+        # 응답을 기다리지 않고 발사만 함 → interval이 응답 대기에 잠식되지 않음
+        asyncio.create_task(fire_request(session))
 
         if interval > 0:
-            time.sleep(interval)
-
-    # 통계 업데이트
-    stats["sent"] += local_sent
-    stats["failed"] += local_failed
+            await asyncio.sleep(interval)
 
 def print_stats():
-    """실시간 통계 출력"""
+    """실시간 통계 출력 (별도 스레드에서 실행)"""
     while True:
         time.sleep(5)
 
@@ -116,13 +121,14 @@ def print_stats():
             print(f"    Logstash 처리 속도가 병목일 수 있습니다.")
 
 def check_logstash_connection():
-    """Logstash 연결 상태 확인"""
+    """Logstash 연결 상태 확인 (동기 - 시작 전 1회만 호출)"""
+    import requests as req
     try:
         print("🔍 Logstash 연결 확인 중...")
-        response = requests.get("http://localhost:9600", timeout=3)
+        req.get("http://localhost:9600", timeout=3)
         print("✅ Logstash 연결 성공!")
         return True
-    except requests.exceptions.ConnectionError:
+    except req.exceptions.ConnectionError:
         print("❌ Logstash에 연결할 수 없습니다!")
         print("\n해결 방법:")
         print("1. docker-compose ps 로 컨테이너 상태 확인")
@@ -133,19 +139,19 @@ def check_logstash_connection():
         print(f"⚠️  연결 확인 중 오류: {e}")
         return False
 
-def run_load_test(num_workers, target_rate_per_worker, duration):
-    """부하 테스트 실행"""
+async def run_load_test(num_workers, target_rate_per_worker, duration):
+    """비동기 부하 테스트 실행"""
 
-    # Logstash 연결 확인
+    # Logstash 연결 확인 (동기)
     if not check_logstash_connection():
         print("\n💡 먼저 ELK 스택을 시작하세요:")
         print("   docker-compose up -d")
         return
 
     print("="*60)
-    print("🚀 ELK 스택 부하 테스트 시작")
+    print("🚀 ELK 스택 부하 테스트 시작 (비동기 모드)")
     print("="*60)
-    print(f"워커 스레드: {num_workers}개")
+    print(f"워커 코루틴: {num_workers}개")
     print(f"워커당 목표 처리율: {target_rate_per_worker} 건/초")
     print(f"총 목표 처리율: {num_workers * target_rate_per_worker} 건/초")
     print(f"테스트 시간: {duration}초")
@@ -154,26 +160,27 @@ def run_load_test(num_workers, target_rate_per_worker, duration):
 
     stats["start_time"] = time.time()
 
-    # 통계 출력 스레드
+    # 통계 출력 스레드 (별도 스레드 - asyncio 루프 블로킹 방지)
     stats_thread = threading.Thread(target=print_stats, daemon=True)
     stats_thread.start()
 
-    # 워커 스레드 시작
-    threads = []
-    for i in range(num_workers):
-        t = threading.Thread(
-            target=send_log_worker,
-            args=(i, target_rate_per_worker, duration)
-        )
-        t.start()
-        threads.append(t)
+    # aiohttp 세션 1개 공유 (커넥션 풀 활용)
+    connector = aiohttp.TCPConnector(limit=num_workers * 2)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # 모든 워커 코루틴을 동시에 실행
+        tasks = [
+            send_log_worker(session, i, target_rate_per_worker, duration)
+            for i in range(num_workers)
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except KeyboardInterrupt:
+            print("\n\n🛑 테스트 중단됨")
 
-    # 모든 워커 완료 대기
-    try:
-        for t in threads:
-            t.join()
-    except KeyboardInterrupt:
-        print("\n\n🛑 테스트 중단됨")
+    # 워커 종료 후 아직 처리 중인 fire-and-forget 요청 완료 대기
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
     # 최종 리포트
     elapsed = time.time() - stats["start_time"]
@@ -251,15 +258,15 @@ def main():
         workers, rate, duration, name = scenarios[choice]
         print(f"\n🎯 {name} 테스트를 시작합니다...\n")
         time.sleep(2)
-        run_load_test(workers, rate, duration)
+        asyncio.run(run_load_test(workers, rate, duration))
     elif choice == "5":
         try:
-            workers = int(input("워커 스레드 수: "))
+            workers = int(input("워커 코루틴 수: "))
             rate = int(input("워커당 처리율 (건/초): "))
             duration = int(input("테스트 시간 (초): "))
             print(f"\n🎯 커스텀 테스트를 시작합니다...\n")
             time.sleep(2)
-            run_load_test(workers, rate, duration)
+            asyncio.run(run_load_test(workers, rate, duration))
         except ValueError:
             print("❌ 잘못된 입력입니다.")
     else:

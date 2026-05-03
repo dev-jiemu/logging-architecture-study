@@ -1,2 +1,6 @@
 http.host: "0.0.0.0"
 xpack.monitoring.enabled: false
+
+# Pipeline 배치 설정 (bulk 처리 튜닝)
+pipeline.batch.size: 500      # 한 번에 ES로 보낼 최대 이벤트 수 (기본값: 125)
+pipeline.batch.delay: 50      # 배치가 다 안 차도 최대 50ms 대기 후 전송 (기본값: 50)

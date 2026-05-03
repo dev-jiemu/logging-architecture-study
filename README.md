@@ -69,4 +69,46 @@ logstach.conf 설정할때
 jiemu@Jiemu-MacBook-Air  ~/IdeaProjects/logging-architecture-study   feature/elk-stack-tutorial ±✚  docker exec logstash nproc
 8
 ```
-스레드 2배로 늘리고 테스트 해봤는데 logstash 는 열심히 CPU 를 사용하는데 elasticsearch 가 변화 없고, 결정적으로 속도 병목도 별 차이가 없는거보니 다른 이유인듯?
+스레드 2배로 늘리고 테스트 해봤는데 logstash 는 열심히 CPU 를 사용하는데 elasticsearch 가 변화 없고, 결정적으로 속도 병목도 별 차이가 없는거보니 다른 이유인듯?  <br>
+=> 테스트를 위한 파이썬 스크립트가 동기로 구현되어 있어서, 비동기 형태로 바꾸니 어느정도 개선이 됨
+
+---
+아래 내용은 claude 한테 정리해달라고 했음 🤔
+### 3. load_test.py 개선 과정 (측정 도구 자체의 구조 문제)
+
+#### 문제 인식
+ELK 스택 성능이 낮다고 생각했는데, 알고보니 **부하를 만들어내는 스크립트 자체가 병목**이었음
+
+#### v1 → v2: 동기 → 비동기 전환 (asyncio + aiohttp)
+기존 동기 방식의 문제:
+```
+요청 → 응답 대기(6ms) → sleep(20ms) → 요청 → ...
+→ 1 사이클 = 26ms → 워커당 최대 38 req/s → 10워커 = 380 req/s 한계
+```
+`requests` 라이브러리를 `aiohttp`로, `threading`을 `asyncio`로 교체하니 응답 대기 시간이 줄었지만 여전히 sleep이 interval을 잠식하는 구조는 동일
+
+#### v2 → v3: Fire-and-Forget 패턴 적용
+**Fire-and-Forget** = "쏘고 잊어버린다"는 뜻으로, 요청을 보낸 후 응답을 기다리지 않고 바로 다음 작업으로 넘어가는 패턴
+
+```
+# v2 구조 (여전히 응답 대기가 interval을 잠식)
+워커: [요청 → 응답 대기(3ms) → sleep(20ms) → 요청 → ...]
+→ 1 사이클 = 23ms → 워커당 43 req/s 한계
+
+# v3 구조 (Fire-and-Forget)
+워커:    [발사 → sleep(20ms) → 발사 → sleep(20ms) → ...]  ← interval 정확히 유지
+응답처리: [   fire_request 태스크가 백그라운드에서 알아서 완료   ]
+→ 1 사이클 = 20ms → 워커당 50 req/s → 10워커 = 500 req/s 달성
+```
+
+`asyncio.create_task(fire_request(session))` 로 요청을 백그라운드 태스크로 던지고,
+워커는 응답을 기다리지 않고 바로 `asyncio.sleep(interval)` 로 넘어가는 구조
+
+#### 결과 비교
+| | v1 동기 | v2 비동기 | v3 Fire-and-Forget |
+|--|--|--|--|
+| 처리율 | 349 req/s | 395 req/s | **473 req/s ✅** |
+| 평균 지연 | 6.6ms | 3.7ms | 3.0ms |
+| P99 | 14.7ms | 9.5ms | 8.8ms |
+| 목표 달성 | 69.8% | 79.0% | **목표 달성** |
+---
