@@ -180,7 +180,7 @@ Kafka를 앞단에 두면 버퍼 역할을 해서 ELK가 자기 페이스로 소
                               다 받아둠        자기 페이스(~5,000 req/s)로 소화
 ```
 
-## Phase 2 : Kafka
+## Phase 2 : Kafka (`feature/kafka-integration`)
 도입 전에, queue 나 redis 등 비교해봄
 
 | | Kafka | RabbitMQ | Redis Streams | Pulsar |
@@ -191,3 +191,82 @@ Kafka를 앞단에 두면 버퍼 역할을 해서 ELK가 자기 페이스로 소
 | 대용량 로그 | ✅ | △ | ❌             | ✅ |
 | 운영 복잡도 | 중간 | 낮음 | 낮음            | 높음 |
 | 로그 파이프라인 적합성 | **⭐ 표준** | 부적합 | 소규모만          | 대안 가능 |
+
+---
+## 2026.05.24 아래 내용들은 claude 한테 정리해달라고 했음 🤔
+
+### 6. Kafka 도입 - 아키텍처 변경
+
+#### 변경 전 / 후
+```
+# Before
+[Application] --HTTP POST--> [Logstash] --> [Elasticsearch] --> [Kibana]
+                                 ↑ 5,000+ req/s 오면 여기서 유실
+
+# After
+[Application] --> [Kafka Topic: logs] --> [Logstash Consumer] --> [Elasticsearch] --> [Kibana]
+                       ↑                        ↑
+                  트래픽 다 받아둠        자기 페이스로 소화 (~5,000 req/s)
+```
+
+Kafka가 **댐** 역할을 해서, 트래픽 스파이크가 와도 메시지를 잃지 않고 ES가 소화 가능한 속도로 처리
+
+#### 수정된 파일 목록
+
+| 파일 | 변경 내용 |
+|--|--|
+| `docker-compose.yml` | Zookeeper + Kafka 서비스 추가, Logstash `depends_on`에 kafka 연결 |
+| `logstash/pipeline/logstash.conf` | input HTTP → Kafka Consumer 로 교체 |
+| `scripts/send_logs.py` | `requests` → `KafkaProducer` (배치 전송, gzip 압축) |
+| `scripts/load_test.py` | `asyncio+aiohttp` → 멀티스레드 `KafkaProducer` 로 전환 |
+
+#### Kafka 리스너 구성
+컨테이너 내부 통신과 로컬 호스트 접근을 포트로 분리했음
+```
+PLAINTEXT://kafka:9092      → 컨테이너끼리 (Logstash → Kafka)
+PLAINTEXT_HOST://localhost:29092 → 로컬 호스트 (Python 스크립트 → Kafka)
+```
+
+#### Producer 설정 (send_logs.py / load_test.py)
+```python
+KafkaProducer(
+    batch_size=65536,        # 64KB 배치로 묶어서 전송 → 처리량 ↑
+    linger_ms=10,            # 10ms 대기 후 배치 전송
+    compression_type="gzip", # 네트워크 비용 절감
+    acks=1                   # leader ack만 받음 (속도 우선)
+)
+```
+
+### 7. Kafka 도입 후 동작 검증
+
+`find_bottleneck.sh` 에 Kafka 모니터링 항목 추가 (6~10번) 후 실행 결과
+
+**Consumer Group Lag = 0** 확인
+```
+GROUP             TOPIC  PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+logstash-consumer logs   0          51              51              0
+```
+- Lag = 0 → Logstash가 Kafka 메시지를 실시간으로 전부 소화 중
+- Logstash `in: 51 / out: 51` → 유실 없이 전부 ES로 전달
+
+**리소스 사용량 (idle 상태)**
+```
+NAME          CPU %   MEM USAGE
+kafka         2.84%   373MiB
+zookeeper     0.39%   87MiB
+logstash      5.28%   664MiB
+elasticsearch 5.17%   1.2GiB
+```
+Kafka + Zookeeper 추가했는데 리소스 부담 크지 않음
+
+#### Phase 1 vs Phase 2 핵심 차이
+
+| 항목 | Phase 1 (ELK) | Phase 2 (ELK + Kafka) |
+|--|--|--|
+| 트래픽 스파이크 | Logstash 드롭 발생 | Kafka가 버퍼링 |
+| ES 장애 시 | 로그 유실 | Kafka offset으로 재처리 가능 |
+| 처리량 확장 | Logstash 스레드 증가 한계 | 파티션 + Consumer 증설 |
+| 지연 | 낮음 (직접 전송) | 약간 증가 (허용 범위) |
+
+다음 할일 : 부하테스트 할거임 ㅇㅂㅇ <br/>
+추가적으로, kafka 버전에 따라 zookeeper 사용을 권장하기도, 안하기도 하는것 같은데 이건 좀더 찾아봐야할듯?
